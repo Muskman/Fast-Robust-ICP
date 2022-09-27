@@ -526,8 +526,14 @@ namespace ICP {
             max_outer(1),
             stop(1e-5),
             use_AA(false),
+            use_stochastic(false),
+            batch_ratio(0.1),
+            inner_batch_ratio(0.01),
+            q_spider(5),
+            step_size(0.6),
             print_energy(false),
             print_output(false),
+            out_path(""),
             anderson_m(5),
             beta_(1.0),
             error_overflow_threshold_(0.05),
@@ -547,6 +553,11 @@ namespace ICP {
         int max_outer;  /// max outer iteration
         double stop;    /// stopping criteria
         bool use_AA;  /// whether using anderson acceleration
+        bool use_stochastic; /// whether using sgd-icp
+        double batch_ratio; /// percentage of points in mini batch
+        double inner_batch_ratio; /// percentate of poins in inner mini batch for spider
+        int q_spider; /// inner iteration number
+        double step_size; /// step size for stochastic ICP
         std::string out_path;
         bool print_energy;///whether print energy
         bool print_output; ///whether write result to txt

@@ -15,7 +15,7 @@ int main(int argc, char const ** argv)
     std::string out_path;
     bool use_init = false;
     MatrixXX res_trans;
-    enum Method{ICP, AA_ICP, FICP, RICP, PPL, RPPL, SparseICP, SICPPPL} method=RICP;
+    enum Method{ICP, AA_ICP, FICP, RICP, PPL, RPPL, SparseICP, SICPPPL, StochasticICP, SpiderICP} method=RICP;
     if(argc == 5)
     {
         file_target = argv[1];
@@ -33,8 +33,9 @@ int main(int argc, char const ** argv)
     {
         std::cout << "Usage: target.ply source.ply out_path <Method>" << std::endl;
         std::cout << "Method :\n"
-                  << "0: ICP\n1: AA-ICP\n2: Our Fast ICP\n3: Our Robust ICP\n4: ICP Point-to-plane\n"
-                  << "5: Our Robust ICP point to plane\n6: Sparse ICP\n7: Sparse ICP point to plane" << std::endl;
+                  << "0: ICP\n1: AA-ICP\n2: Fast ICP\n3: Robust ICP\n4: ICP Point-to-plane\n"
+                  << "5: Robust ICP point to plane\n6: Sparse ICP\n7: Sparse ICP point to plane\n" 
+                  << "8: Stochastic ICP\n9: Spider ICP" << std::endl;
         exit(0);
     }
     int dim = 3;
@@ -166,6 +167,30 @@ int main(int argc, char const ** argv)
         }
         SICP::point_to_plane(vertices_source, vertices_target, normal_target, source_mean, target_mean, spars);
         res_trans = spars.res_trans;
+        break;
+    }
+    case StochasticICP:
+    {
+        pars.f = ICP::NONE;
+        pars.max_icp = 1000;
+        pars.use_AA = false;
+        pars.use_stochastic = true;
+        pars.batch_ratio = 0.1;
+        fricp.point_to_point_stochastic(vertices_source, vertices_target, source_mean, target_mean, pars);
+        res_trans = pars.res_trans;
+        break;
+    }
+    case SpiderICP:
+    {
+        pars.f = ICP::NONE;
+        pars.max_icp = 1000;
+        pars.use_AA = false;
+        pars.use_stochastic = true;
+        pars.batch_ratio = 0.1;
+        pars.inner_batch_ratio = 0.01;
+        pars.q_spider = 3;
+        fricp.point_to_point_spider(vertices_source, vertices_target, source_mean, target_mean, pars);
+        res_trans = pars.res_trans;
         break;
     }
     }

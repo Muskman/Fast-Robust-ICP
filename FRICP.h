@@ -8,6 +8,11 @@
 #define SAME_THRESHOLD 1e-6
 #include <type_traits>
 
+#include <vector>
+#include <cassert>
+#include <iterator>
+#include <random>
+
 template<class T>
 typename std::enable_if<!std::numeric_limits<T>::is_integer, bool>::type
 almost_equal(T x, T y, int ulp)
@@ -172,6 +177,46 @@ private:
         igl::median(X_nearest, med);
         return med;
     }
+
+    // Fisher–Yates_shuffle
+    std::vector<int> FisherYatesShuffle(std::size_t size,
+                                        std::size_t max_size,
+                                        std::mt19937& gen)
+    {
+        assert(size <= max_size);
+        std::vector<int> res(size);
+
+        for (std::size_t i = 0; i != max_size; ++i) {
+            std::uniform_int_distribution<> dis(0, i);
+            std::size_t j = dis(gen);
+            if (j < res.size()) {
+                if (i < res.size()) {
+                    res[i] = res[j];
+                }
+                res[j] = i;
+            }
+        }
+        return res;
+    }
+
+    template <typename Derived1, typename Derived2>
+    double get_absolute_max(Eigen::MatrixBase<Derived1>& X,
+                            Eigen::MatrixBase<Derived2>& Y) {
+            
+            Eigen::VectorXd minX = X.transpose().rowwise().minCoeff();
+            
+            std::cout << "Min X" << minX << std::endl;
+
+            Eigen::VectorXd minY = Y.colwise().minCoeff(); 
+
+            Eigen::VectorXd maxX = X.colwise().maxCoeff();
+            Eigen::VectorXd maxY = Y.colwise().maxCoeff();
+
+            Eigen::VectorXd minXY = minX.cwiseMin(minY).cwiseAbs();
+            Eigen::VectorXd maxXY = maxX.cwiseAbs().cwiseMax(maxY.cwiseAbs());
+
+            return minXY.cwiseMax(maxXY).maxCoeff();
+        }
 
     template <typename Derived1, typename Derived2, typename Derived3>
     AffineNd point_to_point(Eigen::MatrixBase<Derived1>& X,
@@ -557,10 +602,520 @@ public:
                 out_res << times[i] << " "<< energys[i] << " " << gt_mses[i] << std::endl;
             }
             out_res.close();
+            std::cout << "Write res to " << par.out_path << std::endl;
+        }
+    }
+
+    void point_to_point_stochastic(MatrixNX& X, MatrixNX& Y, VectorN& source_mean,
+                        VectorN& target_mean, ICP::Parameters& par){
+        /// Build kd-tree
+        KDtree kdtree(Y);
+        /// Buffers
+        int nPoints = X.cols();
+        int nMPoints = nPoints;
+        if (par.use_stochastic)
+        {
+            nMPoints = ceil(nPoints*par.batch_ratio);
+        }
+        MatrixNX Q = MatrixNX::Zero(N, nMPoints);
+        VectorX W = VectorX::Zero(nMPoints);
+        AffineNd T;
+        AffineNd Tn;
+        if (par.use_init) T.matrix() = par.init_trans;
+        else T = AffineNd::Identity();
+        MatrixXX To1 = T.matrix();
+        MatrixXX To2 = T.matrix();
+        
+        // Test
+        std::cout << "Absolute Max: " << get_absolute_max(X,Y) << std::endl;
+
+        //Anderson Acc para
+        AndersonAcceleration accelerator_;
+        AffineNd SVD_T = T;
+        double energy = .0, last_energy = std::numeric_limits<double>::max();
+
+        //ground truth point clouds
+        MatrixNX X_gt = X;
+        if(par.has_groundtruth)
+        {
+            VectorN temp_trans = par.gt_trans.col(N).head(N);
+            X_gt.colwise() += source_mean;
+            X_gt = par.gt_trans.block(0, 0, N, N) * X_gt;
+            X_gt.colwise() += temp_trans - target_mean;
+        }
+
+        //output para
+        std::string file_out = par.out_path;
+        std::vector<double> times, energys, gt_mses;
+        double begin_time, end_time, run_time;
+        double gt_mse = 0.0;
+
+        // dynamic welsch paras
+        double nu1 = 1, nu2 = 1;
+        double begin_init = omp_get_wtime();
+
+        std::vector<int> random_index(nMPoints);
+
+        // sample points
+        if (par.use_stochastic)
+        {
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            random_index = FisherYatesShuffle(nMPoints, nPoints, gen);
+        }
+        else
+        {
+            std::iota(random_index.begin(), random_index.end(), 0);
+        }
+
+        //Find initial closest points
+        MatrixNX Xs = MatrixNX::Zero(N, nMPoints); // sampled point cloud
+#pragma omp parallel for
+        for (int i = 0; i<nMPoints; ++i) {
+            VectorN p = X.col(random_index[i]);
+            Xs.col(i) = p;
+            VectorN cur_p = T * p;
+            Q.col(i) = Y.col(kdtree.closest(cur_p.data()));
+            W[i] = (cur_p - Q.col(i)).norm();
+        }
+
+
+        if(par.f == ICP::WELSCH) // this may not work yet
+        {
+            //dynamic welsch, calc k-nearest points with itself;
+            nu2 = par.nu_end_k * FindKnearestMed(kdtree, Y, 7);
+            double med1;
+            igl::median(W, med1);
+            nu1 = par.nu_begin_k * med1;
+            nu1 = nu1>nu2? nu1:nu2;
+        }
+        double end_init = omp_get_wtime();
+        double init_time = end_init - begin_init;
+
+        //AA init
+        accelerator_.init(par.anderson_m, (N + 1) * (N + 1), LogMatrix(T.matrix()).data());
+
+        begin_time = omp_get_wtime();
+        bool stop1 = false;
+        while(!stop1)
+        {
+            /// run ICP
+            int icp = 0;
+            for (; icp<par.max_icp; ++icp)
+            {
+                bool accept_aa = false;
+                energy = get_energy(par.f, W, nu1);
+                if (par.use_AA)
+                {
+                    if (energy < last_energy) {
+                        last_energy = energy;
+                        accept_aa = true;
+                    }
+                    else{
+                        accelerator_.replace(LogMatrix(SVD_T.matrix()).data());
+                        // Re-find the closest point // should we resample as well? Stochastic FR-ICP (based on SAM)
+#pragma omp parallel for
+                        for (int i = 0; i<nMPoints; ++i) {
+                            VectorN cur_p = SVD_T * Xs.col(i);
+                            Q.col(i) = Y.col(kdtree.closest(cur_p.data()));
+                            W[i] = (cur_p - Q.col(i)).norm();
+                        }
+                        last_energy = get_energy(par.f, W, nu1);
+                    }
+                }
+                else
+                    last_energy = energy;
+
+                end_time = omp_get_wtime();
+                run_time = end_time - begin_time;
+                if(par.has_groundtruth)
+                {
+                    gt_mse = (T*X - X_gt).squaredNorm()/nPoints;
+                }
+
+                // save results
+                energys.push_back(last_energy);
+                times.push_back(run_time);
+                gt_mses.push_back(gt_mse);
+
+                if (par.print_energy)
+                    std::cout << "icp iter = " << icp << ", Energy = " << last_energy
+                             << ", time = " << run_time << std::endl;
+
+                robust_weight(par.f, W, nu1);
+                
+                // Rotation and translation update
+                if (par.use_stochastic)
+                {
+                    Tn = point_to_point(Xs, Q, W);
+                    Eigen::Matrix4d log_T = LogMatrix(T.matrix());
+                    Eigen::Matrix4d log_Tn = LogMatrix(Tn.matrix());
+                    Vector6 LG_T = LogToVec(log_T);
+                    Vector6 LG_Tn = LogToVec(log_Tn);
+
+                    Vector6 new_t = LG_T + par.step_size * (LG_Tn-LG_T);
+                    T.matrix() = VecToLog(new_t).exp();
+                }
+                else
+                {
+                    T = point_to_point(Xs, Q, W);
+                }
+                
+                //Anderson Acc
+                SVD_T = T;
+                if (par.use_AA)
+                {
+                    AffineMatrixN Trans = (Eigen::Map<const AffineMatrixN>(accelerator_.compute(LogMatrix(T.matrix()).data()).data(), N+1, N+1)).exp();
+                    T.linear() = Trans.block(0,0,N,N);
+                    T.translation() = Trans.block(0,N,N,1);
+                }
+
+                // sample new mini batch # of points
+                if (par.use_stochastic)
+                {
+                    std::random_device rd;
+                    std::mt19937 gen(rd());
+                    random_index = FisherYatesShuffle(nMPoints, nPoints, gen);
+                }
+                else
+                {
+                    std::iota(random_index.begin(), random_index.end(), 0);
+                }
+
+                // Find closest point
+#pragma omp parallel for
+                for (int i = 0; i<nMPoints; ++i) {
+                    VectorN p = X.col(random_index[i]);
+                    Xs.col(i) = p;
+                    VectorN cur_p = T * p ;
+                    Q.col(i) = Y.col(kdtree.closest(cur_p.data()));
+                    W[i] = (cur_p - Q.col(i)).norm();
+                }
+                /// Stopping criteria
+                double stop2 = (T.matrix() - To2).norm();
+                To2 = T.matrix();
+                if(stop2 < par.stop)
+                {
+                    break;
+                }
+            }
+            if(par.f!= ICP::WELSCH)
+                stop1 = true;
+            else
+            {
+                stop1 = fabs(nu1 - nu2)<SAME_THRESHOLD? true: false;
+                nu1 = nu1*par.nu_alpha > nu2? nu1*par.nu_alpha : nu2;
+                if(par.use_AA)
+                {
+                    accelerator_.reset(LogMatrix(T.matrix()).data());
+                    last_energy = std::numeric_limits<double>::max();
+                }
+            }
+        }
+
+        ///calc convergence energy
+        last_energy = get_energy(par.f, W, nu1);
+        X = T * X;
+        gt_mse = (X-X_gt).squaredNorm()/nPoints;
+        T.translation() += - T.rotation() * source_mean + target_mean;
+        X.colwise() += target_mean;
+
+        ///save convergence result
+        par.convergence_energy = last_energy;
+        par.convergence_gt_mse = gt_mse;
+        par.res_trans = T.matrix();
+
+        ///output
+        if (par.print_output)
+        {
+            std::ofstream out_res(par.out_path);
+            if (!out_res.is_open())
+            {
+                std::cout << "Can't open out file " << par.out_path << std::endl;
+            }
+
+            //output time and energy
+            out_res.precision(16);
+            for (int i = 0; i<times.size(); i++)
+            {
+                out_res << times[i] << " "<< energys[i] << " " << gt_mses[i] << std::endl;
+            }
+            out_res.close();
             std::cout << " write res to " << par.out_path << std::endl;
         }
     }
 
+    void point_to_point_spider(MatrixNX& X, MatrixNX& Y, VectorN& source_mean,
+                        VectorN& target_mean, ICP::Parameters& par){
+        /// Build kd-tree
+        KDtree kdtree(Y);
+        /// Buffers
+        int nPoints = X.cols();
+        int nMPoints = nPoints;
+        int nNPoints = nPoints;
+        if (par.use_stochastic)
+        {
+            nMPoints = ceil(nPoints*par.batch_ratio);
+            nNPoints = ceil(nPoints*par.inner_batch_ratio);
+        }
+        MatrixNX Q = MatrixNX::Zero(N, nMPoints);
+        VectorX W = VectorX::Zero(nMPoints);
+        VectorX W1 = VectorX::Ones(nMPoints); // for uniform weights
+        
+        AffineNd T;
+        AffineNd Tn;
+        if (par.use_init) T.matrix() = par.init_trans;
+        else T = AffineNd::Identity();
+        MatrixXX To1 = T.matrix();
+        MatrixXX To2 = T.matrix();
+        
+
+        //Anderson Acc para
+        AndersonAcceleration accelerator_;
+        AffineNd SVD_T = T;
+        double energy = .0, last_energy = std::numeric_limits<double>::max();
+
+        //ground truth point clouds
+        MatrixNX X_gt = X;
+        if(par.has_groundtruth)
+        {
+            VectorN temp_trans = par.gt_trans.col(N).head(N);
+            X_gt.colwise() += source_mean;
+            X_gt = par.gt_trans.block(0, 0, N, N) * X_gt;
+            X_gt.colwise() += temp_trans - target_mean;
+        }
+
+        //output para
+        std::string file_out = par.out_path;
+        std::vector<double> times, energys, gt_mses;
+        double begin_time, end_time, run_time;
+        double gt_mse = 0.0;
+
+        // dynamic welsch paras
+        double nu1 = 1, nu2 = 1;
+        double begin_init = omp_get_wtime();
+
+        std::vector<int> random_index1(nMPoints);
+        std::vector<int> random_index2(nNPoints);
+        std::vector<int> random_index3(nNPoints);
+
+        // sample points
+        if (par.use_stochastic)
+        {
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            random_index1 = FisherYatesShuffle(nMPoints, nPoints, gen);
+        }
+        else
+        {
+            std::iota(random_index1.begin(), random_index1.end(), 0);
+        }
+
+        //Find initial closest points
+        MatrixNX Xs = MatrixNX::Zero(N, nMPoints); // sampled point cloud
+#pragma omp parallel for
+        for (int i = 0; i<nMPoints; ++i) {
+            VectorN p = X.col(random_index1[i]);
+            Xs.col(i) = p;
+            VectorN cur_p = T * p;
+            Q.col(i) = Y.col(kdtree.closest(cur_p.data()));
+            W[i] = (cur_p - Q.col(i)).norm();
+        }
+
+
+        if(par.f == ICP::WELSCH) // this may not work yet
+        {
+            //dynamic welsch, calc k-nearest points with itself;
+            nu2 = par.nu_end_k * FindKnearestMed(kdtree, Y, 7);
+            double med1;
+            igl::median(W, med1);
+            nu1 = par.nu_begin_k * med1;
+            nu1 = nu1>nu2? nu1:nu2;
+        }
+        double end_init = omp_get_wtime();
+        double init_time = end_init - begin_init;
+
+        //AA init
+        accelerator_.init(par.anderson_m, (N + 1) * (N + 1), LogMatrix(T.matrix()).data());
+
+        begin_time = omp_get_wtime();
+        bool stop1 = false;
+        while(!stop1)
+        {
+            /// run ICP
+            int icp = 0;
+            for (; icp<par.max_icp; ++icp)
+            {
+                bool accept_aa = false;
+                energy = get_energy(par.f, W, nu1);
+                if (par.use_AA)
+                {
+                    if (energy < last_energy) {
+                        last_energy = energy;
+                        accept_aa = true;
+                    }
+                    else{
+                        accelerator_.replace(LogMatrix(SVD_T.matrix()).data());
+                        // Re-find the closest point // should we resample as well? Stochastic FR-ICP (based on SAM)
+#pragma omp parallel for
+                        for (int i = 0; i<nMPoints; ++i) {
+                            VectorN cur_p = SVD_T * Xs.col(i);
+                            Q.col(i) = Y.col(kdtree.closest(cur_p.data()));
+                            W[i] = (cur_p - Q.col(i)).norm();
+                        }
+                        last_energy = get_energy(par.f, W, nu1);
+                    }
+                }
+                else
+                    last_energy = energy;
+
+                end_time = omp_get_wtime();
+                run_time = end_time - begin_time;
+                if(par.has_groundtruth)
+                {
+                    gt_mse = (T*X - X_gt).squaredNorm()/nPoints;
+                }
+
+                // save results
+                energys.push_back(last_energy);
+                times.push_back(run_time);
+                gt_mses.push_back(gt_mse);
+
+                if (par.print_energy)
+                    std::cout << "icp iter = " << icp << ", Energy = " << last_energy
+                             << ", time = " << run_time << std::endl;
+                
+                // robust_weight(par.f, W, nu1);
+                
+                // Rotation and translation update
+                if (par.use_stochastic)
+                {
+                    Tn = point_to_point(Xs, Q, W1);
+                    Eigen::Matrix4d log_T = LogMatrix(T.matrix());
+                    Eigen::Matrix4d log_Tn = LogMatrix(Tn.matrix());
+                    Vector6 LG_T = LogToVec(log_T);
+                    Vector6 LG_Tn = LogToVec(log_Tn);
+
+                    Vector6 new_t = LG_T + par.step_size * (LG_Tn-LG_T);
+                    T.matrix() = VecToLog(new_t).exp();
+                }
+                else
+                {
+                    T = point_to_point(Xs, Q, W1);
+                }
+                
+                //Anderson Acc
+                SVD_T = T;
+                if (par.use_AA)
+                {
+                    AffineMatrixN Trans = (Eigen::Map<const AffineMatrixN>(accelerator_.compute(LogMatrix(T.matrix()).data()).data(), N+1, N+1)).exp();
+                    T.linear() = Trans.block(0,0,N,N);
+                    T.translation() = Trans.block(0,N,N,1);
+                }
+
+                // Find closest point
+                // if icp % q == 0 then find correspondences for all points in mini batch
+                if (icp % par.q_spider == 0)
+                {
+                    // sample mini batch # of points
+                    if (par.use_stochastic)
+                    {
+                        std::random_device rd;
+                        std::mt19937 gen(rd());
+                        random_index1 = FisherYatesShuffle(nMPoints, nPoints, gen);
+                    }
+                    else
+                    {
+                        std::iota(random_index1.begin(), random_index1.end(), 0);
+                    }
+
+                    // find correspondences
+#pragma omp parallel for
+                    for (int i = 0; i<nMPoints; ++i) {
+                        VectorN p = X.col(random_index1[i]);
+                        Xs.col(i) = p;
+                        VectorN cur_p = T * p ;
+                        Q.col(i) = Y.col(kdtree.closest(cur_p.data()));
+                        W[i] = (cur_p - Q.col(i)).norm();
+                    }
+                }
+                else
+                {
+                    if (par.use_stochastic)
+                    {
+                        // sample new inner batch # of points from sampling bag
+                        std::random_device rd;
+                        std::mt19937 gen(rd());
+                        random_index2 = FisherYatesShuffle(nNPoints, nPoints, gen);
+                        
+                        // sample inner batch # of points to be replace
+                        random_index3 = FisherYatesShuffle(nNPoints, nMPoints, gen);
+
+                        // find correspondences 
+#pragma omp parallel for
+                        for (int i = 0; i<nNPoints; ++i) {
+                            VectorN p = X.col(random_index2[i]);
+                            Xs.col(random_index3[i]) = p;
+                            VectorN cur_p = T * p ;
+                            Q.col(random_index3[i]) = Y.col(kdtree.closest(cur_p.data()));
+                            W[random_index3[i]] = (cur_p - Q.col(random_index3[i])).norm();
+                            // std::cout <<  W[random_index3[i]] << " " << std::endl;
+                        }
+                    }
+                }
+                /// Stopping criteria
+                double stop2 = (T.matrix() - To2).norm();
+                To2 = T.matrix();
+                if(stop2 < par.stop)
+                {
+                    break;
+                }
+            }
+            if(par.f!= ICP::WELSCH)
+                stop1 = true;
+            else
+            {
+                stop1 = fabs(nu1 - nu2)<SAME_THRESHOLD? true: false;
+                nu1 = nu1*par.nu_alpha > nu2? nu1*par.nu_alpha : nu2;
+                if(par.use_AA)
+                {
+                    accelerator_.reset(LogMatrix(T.matrix()).data());
+                    last_energy = std::numeric_limits<double>::max();
+                }
+            }
+        }
+
+        ///calc convergence energy
+        last_energy = get_energy(par.f, W, nu1);
+        X = T * X;
+        gt_mse = (X-X_gt).squaredNorm()/nPoints;
+        T.translation() += - T.rotation() * source_mean + target_mean;
+        X.colwise() += target_mean;
+
+        ///save convergence result
+        par.convergence_energy = last_energy;
+        par.convergence_gt_mse = gt_mse;
+        par.res_trans = T.matrix();
+
+        ///output
+        if (par.print_output)
+        {
+            std::ofstream out_res(par.out_path);
+            if (!out_res.is_open())
+            {
+                std::cout << "Can't open out file " << par.out_path << std::endl;
+            }
+
+            //output time and energy
+            out_res.precision(16);
+            for (int i = 0; i<times.size(); i++)
+            {
+                out_res << times[i] << " "<< energys[i] << " " << gt_mses[i] << std::endl;
+            }
+            out_res.close();
+            std::cout << " write res to " << par.out_path << std::endl;
+        }
+    }
 
     /// Reweighted ICP with point to plane
     /// @param Source (one 3D point per column)
