@@ -202,21 +202,27 @@ private:
     template <typename Derived1, typename Derived2>
     double get_absolute_max(Eigen::MatrixBase<Derived1>& X,
                             Eigen::MatrixBase<Derived2>& Y) {
-            
-            Eigen::VectorXd minX = X.transpose().rowwise().minCoeff();
-            
-            std::cout << "Min X" << minX << std::endl;
+                                  
+        Eigen::VectorXd minX = X.rowwise().minCoeff();            
+        Eigen::VectorXd minY = Y.rowwise().minCoeff(); 
 
-            Eigen::VectorXd minY = Y.colwise().minCoeff(); 
+        Eigen::VectorXd maxX = X.rowwise().maxCoeff();
+        Eigen::VectorXd maxY = Y.rowwise().maxCoeff();
 
-            Eigen::VectorXd maxX = X.colwise().maxCoeff();
-            Eigen::VectorXd maxY = Y.colwise().maxCoeff();
+        Eigen::VectorXd minXY = minX.cwiseMin(minY).cwiseAbs();
+        Eigen::VectorXd maxXY = maxX.cwiseAbs().cwiseMax(maxY.cwiseAbs());
 
-            Eigen::VectorXd minXY = minX.cwiseMin(minY).cwiseAbs();
-            Eigen::VectorXd maxXY = maxX.cwiseAbs().cwiseMax(maxY.cwiseAbs());
-
-            return minXY.cwiseMax(maxXY).maxCoeff();
+        return minXY.cwiseMax(maxXY).maxCoeff();
         }
+
+    template <typename Derived1>
+    void normalize_cloud(Eigen::MatrixBase<Derived1>& X, double max_absolute) {
+        X = X/max_absolute;
+    }
+
+    void rescale_transformation_matrix(AffineNd& T, double max_absolute) {
+        T.translation() = T.translation()*max_absolute;
+    }
 
     template <typename Derived1, typename Derived2, typename Derived3>
     AffineNd point_to_point(Eigen::MatrixBase<Derived1>& X,
@@ -448,9 +454,9 @@ public:
         if(par.has_groundtruth)
         {
             VectorN temp_trans = par.gt_trans.col(N).head(N);
-            X_gt.colwise() += source_mean;
+            // X_gt.colwise() += source_mean;
             X_gt = par.gt_trans.block(0, 0, N, N) * X_gt;
-            X_gt.colwise() += temp_trans - target_mean;
+            // X_gt.colwise() += temp_trans - target_mean;
         }
 
         //output para
@@ -626,9 +632,8 @@ public:
         MatrixXX To1 = T.matrix();
         MatrixXX To2 = T.matrix();
         
-        // Test
-        std::cout << "Absolute Max: " << get_absolute_max(X,Y) << std::endl;
-
+        // Calculate absolute max, normalize clouds & later renormalize transformation
+ 
         //Anderson Acc para
         AndersonAcceleration accelerator_;
         AffineNd SVD_T = T;
@@ -639,9 +644,9 @@ public:
         if(par.has_groundtruth)
         {
             VectorN temp_trans = par.gt_trans.col(N).head(N);
-            X_gt.colwise() += source_mean;
+            // X_gt.colwise() += source_mean;
             X_gt = par.gt_trans.block(0, 0, N, N) * X_gt;
-            X_gt.colwise() += temp_trans - target_mean;
+            // X_gt.colwise() += temp_trans - target_mean;
         }
 
         //output para
@@ -880,9 +885,9 @@ public:
         if(par.has_groundtruth)
         {
             VectorN temp_trans = par.gt_trans.col(N).head(N);
-            X_gt.colwise() += source_mean;
+            // X_gt.colwise() += source_mean;
             X_gt = par.gt_trans.block(0, 0, N, N) * X_gt;
-            X_gt.colwise() += temp_trans - target_mean;
+            // X_gt.colwise() += temp_trans - target_mean;
         }
 
         //output para
@@ -1145,9 +1150,9 @@ public:
         {
             Eigen::Vector3d temp_trans = par.gt_trans.block(0, 3, 3, 1);
             X_gt = ori_X;
-            X_gt.colwise() += source_mean;
+            // X_gt.colwise() += source_mean;
             X_gt = par.gt_trans.block(0, 0, 3, 3) * X_gt;
-            X_gt.colwise() += temp_trans - target_mean;
+            // X_gt.colwise() += temp_trans - target_mean;
         }
 
         std::vector<double> times, energys, gt_mses;
@@ -1288,9 +1293,9 @@ public:
         {
             Eigen::Vector3d temp_trans = par.gt_trans.block(0, 3, 3, 1);
             X_gt = ori_X;
-            X_gt.colwise() += source_mean;
+            // X_gt.colwise() += source_mean;
             X_gt = par.gt_trans.block(0, 0, 3, 3) * X_gt;
-            X_gt.colwise() += temp_trans - target_mean;
+            // X_gt.colwise() += temp_trans - target_mean;
         }
 
         std::vector<double> times, energys, gt_mses;
